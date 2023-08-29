@@ -9,7 +9,12 @@ import type { BaseNextRequest, BaseNextResponse } from './base-http'
 import type { UrlWithParsedQuery } from 'url'
 
 import { byteLength } from './api-utils/web'
-import BaseServer, { NoFallbackError, Options } from './base-server'
+import BaseServer, {
+  MiddlewareRoutingItem,
+  NoFallbackError,
+  Options,
+  NormalizedRouteManifest,
+} from './base-server'
 import { generateETag } from './lib/etag'
 import { addRequestMeta } from './request-meta'
 import WebResponseCache from './response-cache/web'
@@ -47,10 +52,32 @@ export default class NextWebServer extends BaseServer<WebServerOptions> {
     Object.assign(this.renderOpts, options.webServerConfig.extendRenderOpts)
   }
 
+  protected async handleUpgrade(): Promise<void> {
+    // The web server does not support web sockets.
+  }
+
   protected handleCompression() {
     // For the web server layer, compression is automatically handled by the
     // upstream proxy (edge runtime or node server) and we can simply skip here.
   }
+
+  protected getMiddleware(): MiddlewareRoutingItem | undefined {
+    // The web server does not need to handle middleware. This is done by the
+    // upstream proxy (edge runtime or node server).
+    return undefined
+  }
+
+  protected async getFallbackErrorComponents(): Promise<LoadComponentsReturnType | null> {
+    // The web server does not need to handle fallback errors in production.
+    return null
+  }
+
+  protected getRoutesManifest(): NormalizedRouteManifest | undefined {
+    // The web server does not need to handle rewrite rules. This is done by the
+    // upstream proxy (edge runtime or node server).
+    return undefined
+  }
+
   protected getIncrementalCache({
     requestHeaders,
   }: {

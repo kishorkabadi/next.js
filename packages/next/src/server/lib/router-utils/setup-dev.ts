@@ -14,7 +14,7 @@ import Watchpack from 'watchpack'
 import { loadEnvConfig } from '@next/env'
 import isError from '../../../lib/is-error'
 import findUp from 'next/dist/compiled/find-up'
-import { buildCustomRoute } from './filesystem'
+import { FilesystemDynamicRoute, buildCustomRoute } from './filesystem'
 import * as Log from '../../../build/output/log'
 import HotReloader, {
   matchNextPageBundleRequest,
@@ -90,6 +90,7 @@ import { devPageFiles } from '../../../build/webpack/plugins/next-types-plugin/s
 import type { RenderWorkers } from '../router-server'
 import { pathToRegexp } from 'next/dist/compiled/path-to-regexp'
 import { NextJsHotReloaderInterface } from '../../dev/hot-reloader-types'
+import { isAPIRoute } from '../../../lib/is-api-route'
 
 type SetupOpts = {
   renderWorkers: RenderWorkers
@@ -839,11 +840,28 @@ async function startWatcher(opts: SetupOpts) {
 
   opts.fsChecker.ensureCallback(async function ensure(item) {
     if (item.type === 'appFile' || item.type === 'pageFile') {
+      // If the type is an app file, then we should mark it as an app page.
+      const isApp = item.type === 'appFile'
+
+      // If this is an app file, then we should get the associated app paths
+      // for this file.
+      let page = item.itemPath
+      let itemAppPaths: ReadonlyArray<string> | undefined
+      if (isApp) {
+        itemAppPaths = opts.fsChecker.appPaths.get(item.itemPath)
+        page = opts.fsChecker.appPages.get(page) ?? page
+      }
+
       await hotReloader.ensurePage({
+        isApp,
+        appPaths: itemAppPaths,
+        page,
         clientOnly: false,
-        page: item.itemPath,
-        isApp: item.type === 'appFile',
       })
+
+      // Reload the matchers.
+      // TODO: only reload the matchers for the type that changed, ie, only reload the app worker for app pages
+      await propagateToWorkers('reloadMatchers', undefined)
     }
   })
 
@@ -917,7 +935,6 @@ async function startWatcher(opts: SetupOpts) {
       let middlewareMatchers: MiddlewareMatcher[] | undefined
       const routedPages: string[] = []
       const knownFiles = wp.getTimeInfoEntries()
-      const appPaths: Record<string, string[]> = {}
       const pageNameSet = new Set<string>()
       const conflictingAppPagePaths = new Set<string>()
       const appPageFilePaths = new Map<string, string>()
@@ -928,8 +945,10 @@ async function startWatcher(opts: SetupOpts) {
       let conflictingPageChange = 0
       let hasRootAppNotFound = false
 
-      const { appFiles, pageFiles } = opts.fsChecker
+      const { appPaths, appPages, appFiles, pageFiles } = opts.fsChecker
 
+      appPaths.clear()
+      appPages.clear()
       appFiles.clear()
       pageFiles.clear()
       devPageFiles.clear()
@@ -1054,7 +1073,7 @@ async function startWatcher(opts: SetupOpts) {
 
         if (
           !isAppPath &&
-          pageName.startsWith('/api/') &&
+          isAPIRoute(pageName) &&
           nextConfig.output === 'export'
         ) {
           Log.error(
@@ -1080,13 +1099,17 @@ async function startWatcher(opts: SetupOpts) {
 
           const originalPageName = pageName
           pageName = normalizeAppPath(pageName).replace(/%5F/g, '_')
-          if (!appPaths[pageName]) {
-            appPaths[pageName] = []
+
+          let appPagePaths = appPaths.get(pageName)
+          if (!appPagePaths) {
+            appPagePaths = []
+            appPaths.set(pageName, appPagePaths)
           }
-          appPaths[pageName].push(originalPageName)
+          appPagePaths.push(originalPageName)
 
           if (useFileSystemPublicRoutes) {
             appFiles.add(pageName)
+            appPages.set(pageName, originalPageName)
           }
 
           if (routedPages.includes(pageName)) {
@@ -1353,21 +1376,29 @@ async function startWatcher(opts: SetupOpts) {
         // before it has been built and is populated in the _buildManifest
         const sortedRoutes = getSortedRoutes(routedPages)
 
-        opts.fsChecker.dynamicRoutes = sortedRoutes
-          .map((page) => {
+        opts.fsChecker.dynamicRoutes = sortedRoutes.map(
+          (page): FilesystemDynamicRoute => {
             const regex = getRouteRegex(page)
             return {
+              regex: regex.re.toString(),
               match: getRouteMatcher(regex),
               page,
-              re: regex.re,
-              groups: regex.groups,
+              supportsLocales: opts.fsChecker.supportsLocales(page),
             }
-          })
-          .filter(Boolean) as any
+          }
+        )
 
         const dataRoutes: typeof opts.fsChecker.dynamicRoutes = []
 
         for (const page of sortedRoutes) {
+          // Only add data routes for pages in the `pages/` directory. They are
+          // the only ones that can have `getStaticProps`/`getServerSideProps`.
+          if (!pagesPageFilePaths.has(page)) continue
+
+          // Exclude any `/api` routes as they don't have associated data
+          // routes either.
+          if (!isAPIRoute(page)) continue
+
           const route = buildDataRoute(page, 'development')
           const routeRegex = getRouteRegex(route.page)
           dataRoutes.push({
@@ -1386,6 +1417,9 @@ async function startWatcher(opts: SetupOpts) {
                 : new RegExp(route.dataRouteRegex),
               groups: routeRegex.groups,
             }),
+            // All data routes are for pages anyways and are therefore always
+            // should have their locale prefix stripped.
+            supportsLocales: true,
           })
         }
         opts.fsChecker.dynamicRoutes.unshift(...dataRoutes)

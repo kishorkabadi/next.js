@@ -15,7 +15,7 @@ import {
 import type { MiddlewareManifest } from '../build/webpack/plugins/middleware-plugin'
 import type RenderResult from './render-result'
 import type { FetchEventResult } from './web/types'
-import type { PrerenderManifest } from '../build'
+import type { PrerenderManifest, RoutesManifest } from '../build'
 import { BaseNextRequest, BaseNextResponse } from './base-http'
 import type { PagesManifest } from '../build/webpack/plugins/pages-manifest-plugin'
 import type { PayloadOptions } from './send-payload'
@@ -60,11 +60,12 @@ import BaseServer, {
   MiddlewareRoutingItem,
   NoFallbackError,
   RequestContext,
+  NormalizedRouteManifest,
 } from './base-server'
 import { getMaybePagePath, getPagePath, requireFontManifest } from './require'
 import { denormalizePagePath } from '../shared/lib/page-path/denormalize-page-path'
 import { normalizePagePath } from '../shared/lib/page-path/normalize-page-path'
-import { loadComponents } from './load-components'
+import { LoadComponentsReturnType, loadComponents } from './load-components'
 import isError, { getProperError } from '../lib/is-error'
 import { FontManifest } from './font-utils'
 import { splitCookiesString, toNodeOutgoingHttpHeaders } from './web/utils'
@@ -80,9 +81,11 @@ import { IncrementalCache } from './lib/incremental-cache'
 import { normalizeAppPath } from '../shared/lib/router/utils/app-paths'
 
 import { setHttpClientAndAgentOptions } from './setup-http-agent-env'
-import { RouteKind } from './future/route-kind'
 
-import { PagesAPIRouteMatch } from './future/route-matches/pages-api-route-match'
+import {
+  PagesAPIRouteMatch,
+  isPagesAPIRouteMatch,
+} from './future/route-matches/pages-api-route-match'
 import { MatchOptions } from './future/route-matcher-managers/route-matcher-manager'
 import { INSTRUMENTATION_HOOK_FILENAME } from '../lib/constants'
 import { getTracer } from './lib/trace/tracer'
@@ -197,24 +200,18 @@ export default class NextNodeServer extends BaseServer {
     }
 
     if (!options.dev) {
-      const routesManifest = this.getRoutesManifest() as {
-        dynamicRoutes: {
-          page: string
-          regex: string
-          namedRegex?: string
-          routeKeys?: { [key: string]: string }
-        }[]
-      }
-      this.dynamicRoutes = routesManifest.dynamicRoutes.map((r) => {
+      const { dynamicRoutes = [] } = this.getRoutesManifest() ?? {}
+      this.dynamicRoutes = dynamicRoutes.map((r) => {
+        // TODO: can we just re-use the regex from the manifest?
         const regex = getRouteRegex(r.page)
         const match = getRouteMatcher(regex)
 
         return {
           match,
           page: r.page,
-          regex: regex.re,
+          re: regex.re,
         }
-      }) as any
+      })
     }
 
     // ensure options are set when loadConfig isn't called
@@ -225,6 +222,11 @@ export default class NextNodeServer extends BaseServer {
       const { interceptTestApis } = require('../experimental/testmode/server')
       interceptTestApis()
     }
+  }
+
+  protected async handleUpgrade(): Promise<void> {
+    // The web server does not support web sockets, it's only used for HMR in
+    // development.
   }
 
   protected async prepareImpl() {
@@ -551,7 +553,8 @@ export default class NextNodeServer extends BaseServer {
 
   protected async renderPageComponent(
     ctx: RequestContext,
-    bubbleNoFallback: boolean
+    bubbleNoFallback: boolean,
+    match: RouteMatch | undefined
   ) {
     const edgeFunctionsPages = this.getEdgeFunctionsPages() || []
     if (edgeFunctionsPages.length) {
@@ -579,7 +582,7 @@ export default class NextNodeServer extends BaseServer {
       }
     }
 
-    return super.renderPageComponent(ctx, bubbleNoFallback)
+    return super.renderPageComponent(ctx, bubbleNoFallback, match)
   }
 
   protected async findPageComponents({
@@ -587,11 +590,13 @@ export default class NextNodeServer extends BaseServer {
     query,
     params,
     isAppPath,
+    match,
   }: {
     pathname: string
     query: NextParsedUrlQuery
     params: Params | null
     isAppPath: boolean
+    match: RouteMatch | undefined
   }): Promise<FindComponentsResult | null> {
     let route = pathname
     if (isAppPath) {
@@ -607,7 +612,14 @@ export default class NextNodeServer extends BaseServer {
           'next.route': route,
         },
       },
-      () => this.findPageComponentsImpl({ pathname, query, params, isAppPath })
+      () =>
+        this.findPageComponentsImpl({
+          pathname,
+          query,
+          params,
+          isAppPath,
+          match,
+        })
     )
   }
 
@@ -616,11 +628,13 @@ export default class NextNodeServer extends BaseServer {
     query,
     params,
     isAppPath,
+    match,
   }: {
     pathname: string
     query: NextParsedUrlQuery
     params: Params | null
     isAppPath: boolean
+    match: RouteMatch | undefined
   }): Promise<FindComponentsResult | null> {
     const paths: string[] = [pathname]
     if (query.amp) {
@@ -631,7 +645,7 @@ export default class NextNodeServer extends BaseServer {
       )
     }
 
-    if (query.__nextLocale) {
+    if (!isAppPath && query.__nextLocale) {
       paths.unshift(
         ...paths.map(
           (path) => `/${query.__nextLocale}${path === '/' ? '' : path}`
@@ -645,9 +659,11 @@ export default class NextNodeServer extends BaseServer {
           distDir: this.distDir,
           pathname: pagePath,
           isAppPath,
+          match,
         })
 
         if (
+          !isAppPath &&
           query.__nextLocale &&
           typeof components.Component === 'string' &&
           !pagePath.startsWith(`/${query.__nextLocale}`)
@@ -806,82 +822,81 @@ export default class NextNodeServer extends BaseServer {
   protected async handleCatchallRenderRequest(
     req: BaseNextRequest,
     res: BaseNextResponse,
-    parsedUrl: NextUrlWithParsedQuery
+    parsedUrl: NextUrlWithParsedQuery,
+    match: RouteMatch | null
   ) {
     let { pathname, query } = parsedUrl
-
     if (!pathname) {
-      throw new Error('pathname is undefined')
+      throw new Error('Invariant: pathname is undefined')
     }
+
+    // This is a catch-all route, there should be no fallbacks so mark it as
+    // such.
     query._nextBubbleNoFallback = '1'
-    const bubbleNoFallback = true
 
     try {
       // next.js core assumes page path without trailing slash
       pathname = removeTrailingSlash(pathname)
 
-      const options: MatchOptions = {
-        i18n: this.i18nProvider?.fromQuery(pathname, query),
+      // If a match wasn't provided, try to find one.
+      if (!match) {
+        const options: MatchOptions = {
+          i18n: this.i18nProvider?.fromQuery(pathname, query),
+        }
+        match = await this.matchers.match(pathname, options)
       }
-      const match = await this.matchers.match(pathname, options)
 
-      // Try to handle the given route with the configured handlers.
-      if (match) {
-        // Add the match to the request so we don't have to re-run the matcher
-        // for the same request.
-        addRequestMeta(req, '_nextMatch', match)
+      // If we don't have a match, try to render it anyways.
+      if (!match) {
+        await this.render(req, res, pathname, query, parsedUrl, true)
 
-        // TODO-APP: move this to a route handler
-        const edgeFunctionsPages = this.getEdgeFunctionsPages()
-        for (const edgeFunctionsPage of edgeFunctionsPages) {
-          if (edgeFunctionsPage === match.definition.page) {
-            if (this.nextConfig.output === 'export') {
-              await this.render404(req, res, parsedUrl)
-              return { finished: true }
-            }
-            delete query._nextBubbleNoFallback
-            delete query[NEXT_RSC_UNION_QUERY]
+        return { finished: true }
+      }
 
-            const handledAsEdgeFunction = await this.runEdgeFunction({
-              req,
-              res,
-              query,
-              params: match.params,
-              page: match.definition.page,
-              match,
-              appPaths: null,
-            })
+      // Add the match to the request so we don't have to re-run the matcher
+      // for the same request.
+      addRequestMeta(req, '_nextMatch', match)
 
-            if (handledAsEdgeFunction) {
-              return { finished: true }
-            }
-          }
+      // TODO-APP: move this to a route handler
+      const edgeFunctionsPages = this.getEdgeFunctionsPages()
+      for (const edgeFunctionsPage of edgeFunctionsPages) {
+        // If the page doesn't match the edge function page, skip it.
+        if (edgeFunctionsPage !== match.definition.page) continue
+
+        if (this.nextConfig.output === 'export') {
+          await this.render404(req, res, parsedUrl)
+          return { finished: true }
         }
-        let handled = false
 
-        // If the route was detected as being a Pages API route, then handle
-        // it.
-        // TODO: move this behavior into a route handler.
-        if (match.definition.kind === RouteKind.PAGES_API) {
-          if (this.nextConfig.output === 'export') {
-            await this.render404(req, res, parsedUrl)
-            return { finished: true }
-          }
-          delete query._nextBubbleNoFallback
+        delete query._nextBubbleNoFallback
+        delete query[NEXT_RSC_UNION_QUERY]
 
-          handled = await this.handleApiRequest(
-            req,
-            res,
-            query,
-            // TODO: see if we can add a runtime check for this
-            match as PagesAPIRouteMatch
-          )
-          if (handled) return { finished: true }
+        const handled = await this.runEdgeFunction({
+          req,
+          res,
+          query,
+          params: match.params,
+          page: match.definition.page,
+          match,
+          appPaths: null,
+        })
+
+        // If we handled the request, we can return early.
+        if (handled) return { finished: true }
+      }
+
+      // If the route was detected as being a Pages API route, then handle
+      // it.
+      // TODO: move this behavior into a route handler.
+      if (isPagesAPIRouteMatch(match)) {
+        if (this.nextConfig.output === 'export') {
+          await this.render404(req, res, parsedUrl)
+          return { finished: true }
         }
-        // else if (match.definition.kind === RouteKind.METADATA_ROUTE) {
-        //   handled = await this.handlers.handle(match, req, res)
-        //   if (handled) return { finished: true }
-        // }
+        delete query._nextBubbleNoFallback
+
+        const handled = await this.handleApiRequest(req, res, query, match)
+        if (handled) return { finished: true }
       }
 
       await this.render(req, res, pathname, query, parsedUrl, true)
@@ -890,7 +905,7 @@ export default class NextNodeServer extends BaseServer {
         finished: true,
       }
     } catch (err: any) {
-      if (err instanceof NoFallbackError && bubbleNoFallback) {
+      if (err instanceof NoFallbackError) {
         if (this.isRenderWorker) {
           res.setHeader('x-no-fallback', '1')
           res.send()
@@ -1641,18 +1656,28 @@ export default class NextNodeServer extends BaseServer {
     return (this._cachedPreviewManifest = manifest)
   }
 
-  protected getRoutesManifest() {
+  protected getRoutesManifest(): NormalizedRouteManifest | undefined {
     return getTracer().trace(NextNodeServerSpan.getRoutesManifest, () => {
-      const manifest = require(join(this.distDir, ROUTES_MANIFEST))
+      const manifest: RoutesManifest = require(join(
+        this.distDir,
+        ROUTES_MANIFEST
+      ))
 
-      if (Array.isArray(manifest.rewrites)) {
-        manifest.rewrites = {
+      let rewrites = manifest.rewrites ?? {
+        beforeFiles: [],
+        afterFiles: [],
+        fallback: [],
+      }
+
+      if (Array.isArray(rewrites)) {
+        rewrites = {
           beforeFiles: [],
-          afterFiles: manifest.rewrites,
+          afterFiles: rewrites,
           fallback: [],
         }
       }
-      return manifest
+
+      return { ...manifest, rewrites }
     })
   }
 
@@ -1795,5 +1820,11 @@ export default class NextNodeServer extends BaseServer {
 
   protected get serverDistDir() {
     return join(this.distDir, SERVER_DIRECTORY)
+  }
+
+  protected async getFallbackErrorComponents(): Promise<LoadComponentsReturnType | null> {
+    // Not implemented for production use cases, this is implemented on the
+    // development server.
+    return null
   }
 }

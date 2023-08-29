@@ -11,6 +11,7 @@ import type {
   GetStaticProps,
 } from 'next/types'
 import type { RouteModule } from './future/route-modules/route-module'
+import type { RouteMatch } from './future/route-matches/route-match'
 
 import {
   BUILD_MANIFEST,
@@ -26,6 +27,8 @@ import { getTracer } from './lib/trace/tracer'
 import { LoadComponentsSpan } from './lib/trace/constants'
 import { loadManifest } from './load-manifest'
 import { wait } from '../lib/wait'
+import { RouteKind } from './future/route-kind'
+
 export type ManifestItem = {
   id: number | string
   files: string[]
@@ -119,29 +122,31 @@ async function loadComponentsImpl({
   distDir,
   pathname,
   isAppPath,
+  match,
 }: {
   distDir: string
   pathname: string
   isAppPath: boolean
+  match?: RouteMatch
 }): Promise<LoadComponentsReturnType> {
   let DocumentMod = {}
   let AppMod = {}
   if (!isAppPath) {
     ;[DocumentMod, AppMod] = await Promise.all([
-      Promise.resolve().then(() => requirePage('/_document', distDir, false)),
-      Promise.resolve().then(() => requirePage('/_app', distDir, false)),
+      requirePage('/_document', distDir, false),
+      requirePage('/_app', distDir, false),
     ])
   }
-  const ComponentMod = await Promise.resolve().then(() =>
-    requirePage(pathname, distDir, isAppPath)
-  )
+
+  const ComponentMod = await requirePage(pathname, distDir, isAppPath, match)
 
   // Make sure to avoid loading the manifest for Route Handlers
-  const hasClientManifest =
-    isAppPath &&
-    (pathname.endsWith('/page') ||
-      pathname === '/not-found' ||
-      pathname === '/_not-found')
+  const hasClientManifest = match
+    ? match.definition.kind === RouteKind.APP_PAGE
+    : isAppPath &&
+      (pathname.endsWith('/page') ||
+        pathname === '/not-found' ||
+        pathname === '/_not-found')
 
   const [
     buildManifest,
@@ -179,7 +184,8 @@ async function loadComponentsImpl({
   const Document = interopDefault(DocumentMod)
   const App = interopDefault(AppMod)
 
-  const { getServerSideProps, getStaticProps, getStaticPaths } = ComponentMod
+  const { getServerSideProps, getStaticProps, getStaticPaths, routeModule } =
+    ComponentMod
 
   return {
     App,
@@ -196,7 +202,7 @@ async function loadComponentsImpl({
     serverActionsManifest,
     isAppPath,
     pathname,
-    routeModule: ComponentMod.routeModule,
+    routeModule,
   }
 }
 

@@ -10,7 +10,7 @@ import { formatHostname } from 'next/dist/server/lib/format-hostname'
 
 export function attachRequestMeta(
   req: BaseNextRequest,
-  parsedUrl: NextUrlWithParsedQuery,
+  parsedUrl: Pick<NextUrlWithParsedQuery, 'query'>,
   hostname: string
 ) {
   const protocol = (

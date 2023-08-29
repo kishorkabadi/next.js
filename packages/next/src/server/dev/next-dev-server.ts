@@ -10,6 +10,7 @@ import type { BaseNextRequest, BaseNextResponse } from '../base-http'
 import type { FallbackMode, MiddlewareRoutingItem } from '../base-server'
 import type { FunctionComponent } from 'react'
 import type { RouteMatch } from '../future/route-matches/route-match'
+import type { NextUrlWithParsedQuery } from '../request-meta'
 
 import { Worker } from 'next/dist/compiled/jest-worker'
 import { join as pathJoin } from 'path'
@@ -59,7 +60,6 @@ import { DefaultFileReader } from '../future/route-matcher-providers/dev/helpers
 import { NextBuildContext } from '../../build/build-context'
 import { IncrementalCache } from '../lib/incremental-cache'
 import LRUCache from 'next/dist/compiled/lru-cache'
-import { NextUrlWithParsedQuery } from '../request-meta'
 import { errorToJSON } from '../render'
 import { getMiddlewareRouteMatcher } from '../../shared/lib/router/utils/middleware-route-matcher'
 import {
@@ -185,7 +185,7 @@ export default class DevServer extends Server {
     this.appDir = appDir
   }
 
-  protected getRoutes() {
+  protected getRouteMatchers() {
     const { pagesDir, appDir } = findPagesDir(
       this.dir,
       !!this.nextConfig.experimental.appDir
@@ -201,9 +201,8 @@ export default class DevServer extends Server {
       },
     }
 
-    const routes = super.getRoutes()
     const matchers = new DevRouteMatcherManager(
-      routes.matchers,
+      super.getRouteMatchers(),
       ensurer,
       this.dir
     )
@@ -228,12 +227,7 @@ export default class DevServer extends Server {
         )
       )
       matchers.push(
-        new DevPagesAPIRouteMatcherProvider(
-          pagesDir,
-          extensions,
-          fileReader,
-          this.localeNormalizer
-        )
+        new DevPagesAPIRouteMatcherProvider(pagesDir, extensions, fileReader)
       )
     }
 
@@ -257,7 +251,7 @@ export default class DevServer extends Server {
       )
     }
 
-    return { matchers }
+    return matchers
   }
 
   protected getBuildId(): string {
@@ -272,7 +266,6 @@ export default class DevServer extends Server {
 
     await super.prepareImpl()
     await this.runInstrumentationHookIfAvailable()
-    await this.matchers.reload()
     this.setDevReady!()
 
     // This is required by the tracing subsystem.
@@ -455,9 +448,9 @@ export default class DevServer extends Server {
       parsedUrl.pathname = removePathPrefix(parsedUrl.pathname || '/', basePath)
     }
 
-    const { pathname } = parsedUrl
+    const pathname = parsedUrl.pathname || '/'
 
-    if (pathname!.startsWith('/_next')) {
+    if (pathname.startsWith('/_next')) {
       if (await fileExists(pathJoin(this.publicDir, '_next'))) {
         throw new Error(PUBLIC_DIR_MIDDLEWARE_CONFLICT)
       }
@@ -477,8 +470,8 @@ export default class DevServer extends Server {
       if (!res.sent) {
         res.statusCode = 500
         try {
-          return await this.renderError(err, req, res, pathname!, {
-            __NEXT_PAGE: (isError(err) && err.page) || pathname || '',
+          return await this.renderError(err, req, res, pathname, {
+            __NEXT_PAGE: (isError(err) && err.page) || pathname,
           })
         } catch (internalErr) {
           console.error(internalErr)
@@ -768,6 +761,7 @@ export default class DevServer extends Server {
     isAppPath,
     appPaths = null,
     shouldEnsure,
+    match,
   }: {
     pathname: string
     query: ParsedUrlQuery
@@ -775,6 +769,7 @@ export default class DevServer extends Server {
     isAppPath: boolean
     appPaths?: string[] | null
     shouldEnsure: boolean
+    match: RouteMatch | undefined
   }): Promise<FindComponentsResult | null> {
     await this.devReady
     const compilationErr = await this.getCompilationError(pathname)
@@ -803,6 +798,7 @@ export default class DevServer extends Server {
         query,
         params,
         isAppPath,
+        match,
       })
     } catch (err) {
       if ((err as any).code !== 'ENOENT') {

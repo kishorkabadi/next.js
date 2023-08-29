@@ -1,4 +1,4 @@
-import { join } from 'path'
+import path from 'path'
 import {
   FONT_MANIFEST,
   PAGES_MANIFEST,
@@ -13,19 +13,14 @@ import { PageNotFoundError, MissingStaticPage } from '../shared/lib/utils'
 import LRUCache from 'next/dist/compiled/lru-cache'
 import { loadManifest } from './load-manifest'
 import { promises } from 'fs'
+import { RouteMatch } from './future/route-matches/route-match'
 
 const isDev = process.env.NODE_ENV === 'development'
-const pagePathCache = isDev
-  ? {
-      get: (_key: string) => {
-        return null
-      },
-      set: () => {},
-      has: () => false,
-    }
-  : new LRUCache<string, string | null>({
+const pagePathCache = !isDev
+  ? new LRUCache<string, string | null>({
       max: 1000,
     })
+  : null
 
 export function getMaybePagePath(
   page: string,
@@ -35,21 +30,22 @@ export function getMaybePagePath(
 ): string | null {
   const cacheKey = `${page}:${distDir}:${locales}:${isAppPath}`
 
-  if (pagePathCache.has(cacheKey)) {
-    return pagePathCache.get(cacheKey) as string | null
-  }
+  let pagePath = pagePathCache?.get(cacheKey)
 
-  const serverBuildPath = join(distDir, SERVER_DIRECTORY)
+  // If we have a cached path, we can return it directly.
+  if (pagePath) return pagePath
+
+  const serverBuildPath = path.join(distDir, SERVER_DIRECTORY)
   let appPathsManifest: undefined | PagesManifest
 
   if (isAppPath) {
     appPathsManifest = loadManifest(
-      join(serverBuildPath, APP_PATHS_MANIFEST),
+      path.join(serverBuildPath, APP_PATHS_MANIFEST),
       !isDev
     )
   }
   const pagesManifest = loadManifest(
-    join(serverBuildPath, PAGES_MANIFEST),
+    path.join(serverBuildPath, PAGES_MANIFEST),
     !isDev
   ) as PagesManifest
 
@@ -74,7 +70,6 @@ export function getMaybePagePath(
     }
     return curPath
   }
-  let pagePath: string | undefined
 
   if (appPathsManifest) {
     pagePath = checkManifest(appPathsManifest)
@@ -85,14 +80,14 @@ export function getMaybePagePath(
   }
 
   if (!pagePath) {
-    pagePathCache.set(cacheKey, null)
+    pagePathCache?.set(cacheKey, null)
     return null
   }
 
-  const path = join(serverBuildPath, pagePath)
-  pagePathCache.set(cacheKey, path)
+  pagePath = path.join(serverBuildPath, pagePath)
 
-  return path
+  pagePathCache?.set(cacheKey, pagePath)
+  return pagePath
 }
 
 export function getPagePath(
@@ -113,9 +108,16 @@ export function getPagePath(
 export function requirePage(
   page: string,
   distDir: string,
-  isAppPath: boolean
+  isAppPath: boolean,
+  match?: RouteMatch
 ): any {
-  const pagePath = getPagePath(page, distDir, undefined, isAppPath)
+  let pagePath: string
+  if (match) {
+    pagePath = match.definition.filename
+  } else {
+    pagePath = getPagePath(page, distDir, undefined, isAppPath)
+  }
+
   if (pagePath.endsWith('.html')) {
     return promises.readFile(pagePath, 'utf8').catch((err) => {
       throw new MissingStaticPage(page, err.message)
@@ -129,7 +131,7 @@ export function requirePage(
 }
 
 export function requireFontManifest(distDir: string) {
-  const serverBuildPath = join(distDir, SERVER_DIRECTORY)
-  const fontManifest = loadManifest(join(serverBuildPath, FONT_MANIFEST))
+  const serverBuildPath = path.join(distDir, SERVER_DIRECTORY)
+  const fontManifest = loadManifest(path.join(serverBuildPath, FONT_MANIFEST))
   return fontManifest
 }
